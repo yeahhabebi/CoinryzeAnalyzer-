@@ -1,14 +1,13 @@
 # app.py
 """
-Coinryze Analyzer - Full Streamlit dashboard with Cloudflare R2 integration.
-
+Coinryze Analyzer (final) - supports issue_id,timestamp,number,color,size format
 Features:
-- Manual Input Form (add single draw)
-- Bulk CSV Upload (append many past draws)
-- Smart Predictions (frequency + streak heuristics)
-- Auto-Refresh (set interval in sidebar)
-- Sync CSVs to Cloudflare R2: last_draws.csv, predictions.csv, accuracy_log.csv
-- Accuracy tracking and chart
+- Manual single draw input (fields or paste CSV line)
+- Paste multiple lines from coinryze.org format
+- Bulk CSV upload
+- Historical draws (top 50)
+- Auto-predict toggle (predict next result(s) immediately after adding)
+- R2 sync (last_draws.csv, predictions.csv, accuracy_log.csv)
 """
 
 import streamlit as st
@@ -16,385 +15,432 @@ import pandas as pd
 import numpy as np
 import boto3
 from botocore.exceptions import ClientError
-from io import BytesIO
-import altair as alt
+from io import BytesIO, StringIO
 import datetime
 import json
-import html
 
 # --------------------------
-# R2 Configuration (already provided)
+# R2 Configuration (already provided by you)
 # --------------------------
 R2_KEY_ID = "7423969d6d623afd9ae23258a6cd2839"
 R2_SECRET = "dd858bf600c0d8e63cd047d128b46ad6df0427daef29f57c312530da322fc63c"
 R2_BUCKET = "coinryze-analyzer"
 R2_ENDPOINT = "https://6d266c53f2f03219a25de8f12c50bc3b.r2.cloudflarestorage.com"
 
-# Filenames used in the app
-F_LAST_DRAWS = "last_draws.csv"        # historical draws (append here)
-F_PREDICTIONS = "predictions.csv"      # predictions history
-F_ACCURACY = "accuracy_log.csv"        # accuracy history
+# filenames
+F_LAST_DRAWS = "last_draws.csv"
+F_PREDICTIONS = "predictions.csv"
+F_ACCURACY = "accuracy_log.csv"
 
-# Create S3/R2 client
+# S3/R2 client
 s3 = boto3.client(
-    's3',
-    region_name='auto',
+    "s3",
+    region_name="auto",
     endpoint_url=R2_ENDPOINT,
     aws_access_key_id=R2_KEY_ID,
-    aws_secret_access_key=R2_SECRET
+    aws_secret_access_key=R2_SECRET,
 )
 
 # --------------------------
-# Helper functions for R2
+# Helpers: R2 interactions
 # --------------------------
-def r2_get_object_bytes(key):
-    """Return bytes of object from R2 or None if not exists"""
+def r2_get_bytes(key):
     try:
         resp = s3.get_object(Bucket=R2_BUCKET, Key=key)
-        return resp['Body'].read()
-    except ClientError as e:
-        #  NoSuchKey or other access errors
+        return resp["Body"].read()
+    except ClientError:
         return None
 
 def r2_put_bytes(key, bts, content_type="text/csv"):
-    """Put bytes to R2. Returns True if OK."""
     try:
         s3.put_object(Bucket=R2_BUCKET, Key=key, Body=bts, ContentType=content_type)
         return True
     except ClientError as e:
-        st.error(f"R2 upload error for {key}: {e}")
+        st.error(f"R2 upload error: {e}")
         return False
 
 def r2_list_keys(prefix=""):
     try:
         resp = s3.list_objects_v2(Bucket=R2_BUCKET, Prefix=prefix)
-        return [o['Key'] for o in resp.get('Contents', [])]
+        return [o["Key"] for o in resp.get("Contents", [])]
     except ClientError:
         return []
 
 # --------------------------
-# Data loading/saving helpers
+# Data loading / initialisation
 # --------------------------
-def load_csv_from_r2_or_local(key, local_path=None):
-    """Try to load CSV from R2; if not available, fallback to local path (if given)."""
-    b = r2_get_object_bytes(key)
+def load_df_from_r2_or_local(key, local_path=None, cols=None):
+    b = r2_get_bytes(key)
     if b is not None:
-        return pd.read_csv(BytesIO(b))
+        try:
+            return pd.read_csv(BytesIO(b), dtype=str)
+        except Exception:
+            return pd.read_csv(StringIO(b.decode("utf-8")), dtype=str)
     if local_path:
         try:
-            return pd.read_csv(local_path)
-        except FileNotFoundError:
+            return pd.read_csv(local_path, dtype=str)
+        except Exception:
             return None
-    return None
+    # fallback empty
+    if cols:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame()
 
-def save_df_to_r2(df, key):
-    b = df.to_csv(index=False).encode('utf-8')
-    return r2_put_bytes(key, b)
+# canonical columns for draws
+DRAW_COLS = ["issue_id", "timestamp", "number", "color", "size"]
+
+last_draws = load_df_from_r2_or_local(F_LAST_DRAWS, local_path="backend/data/seed.csv", cols=DRAW_COLS)
+predictions_df = load_df_from_r2_or_local(F_PREDICTIONS, cols=["created_at", "prediction", "pick_count"])
+accuracy_log = load_df_from_r2_or_local(F_ACCURACY, cols=["timestamp", "predicted", "actual", "accuracy_pct"])
+
+# ensure types
+for df in (last_draws, predictions_df, accuracy_log):
+    if df is None:
+        df = pd.DataFrame()
 
 # --------------------------
-# Smart prediction algorithm (simple heuristic)
-# - Use frequency of numbers in historical draws
-# - Prefer numbers that are 'hot' and avoid very recent repeats (basic streak handling)
-# NOTE: Adjust to your draw format (here we assume draws are sets of integers in columns 'n1'..'n6')
+# Mapping rules (from your notes)
+# - Numbers are single-digit 0..9
+# - Size: 0-4 -> Small, 5-9 -> Big
+# - Color:
+#     - by default 0-4 -> Red, 5-9 -> Green
+#     - special rule: numbers equal to 0 -> Red-purple, 5 -> Green-purple
+#   (This is inferred from your note; adjust if needed)
 # --------------------------
-def simple_predict(df_last_draws, pick_count=6):
-    """
-    df_last_draws: DataFrame with columns ['date','n1','n2',...]
-    returns list of predicted numbers
-    """
-    # Flatten number columns
-    num_cols = [c for c in df_last_draws.columns if c.startswith('n')]
-    if not num_cols:
+def infer_size_from_number(n):
+    try:
+        n = int(n)
+    except:
+        return ""
+    return "Small" if 0 <= n <= 4 else "Big"
+
+def infer_color_from_number(n):
+    try:
+        n = int(n)
+    except:
+        return ""
+    if n == 0:
+        return "Red-purple"
+    if n == 5:
+        return "Green-purple"
+    return "Red" if 0 <= n <= 4 else "Green"
+
+# --------------------------
+# Prediction logic for 0..9 numbers
+# - Simple frequency + recency penalty heuristic
+# - pick_count defaults to 1 (you can choose more)
+# --------------------------
+def predict_next_numbers(df_draws, pick_count=1):
+    # if no history, return empty
+    if df_draws is None or df_draws.shape[0] == 0:
         return []
-
-    numbers = df_last_draws[num_cols].values.flatten()
-    numbers = numbers[~pd.isna(numbers)].astype(int)
-    freq = pd.Series(numbers).value_counts().sort_values(ascending=False)
-    # Basic streak detection: compute last occurrence (index) for each number (higher index == more recent)
-    last_occ = {}
-    for idx, row in df_last_draws.reset_index().iterrows():
-        for c in num_cols:
-            val = row.get(c)
-            if pd.notna(val):
-                last_occ[int(val)] = idx  # last seen at idx
-
-    # Score = frequency * weight - recency_penalty
+    # use numeric series of 'number' column
+    nums = []
+    for v in df_draws["number"].astype(str).values:
+        try:
+            nums.append(int(v))
+        except:
+            continue
+    if not nums:
+        return []
+    freq = pd.Series(nums).value_counts().to_dict()  # number -> freq
+    # recency: index of last occurrence (higher = more recent)
+    last_index = {}
+    for idx, v in enumerate(df_draws["number"].astype(str).values[::-1]):  # reverse for recency 0=most recent
+        try:
+            val = int(v)
+            if val not in last_index:
+                last_index[val] = idx
+        except:
+            continue
+    # score = freq*(1.0) - recency*0.2
     scores = {}
-    for num, f in freq.items():
-        recency = last_occ.get(int(num), 1e6)
-        score = f * 2.0 - (recency * 0.01)  # tweak weights as desired
-        scores[int(num)] = score
-
-    # Include numbers not yet seen with small base score, to allow novelty
-    all_candidate_nums = range(1, 51)  # assume numbers 1..50 (adjust if different)
-    for n in all_candidate_nums:
-        if n not in scores:
-            scores[n] = 0.1
-
-    # Pick top `pick_count` numbers by score
+    for n in range(0, 10):
+        f = freq.get(n, 0)
+        rec = last_index.get(n, 10000)
+        scores[n] = f * 1.0 - rec * 0.2
+    # sort by score desc
     sorted_nums = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    picked = [n for n, s in sorted_nums[:pick_count]]
-    return picked
+    picks = [n for n, s in sorted_nums[:pick_count]]
+    return picks
 
 # --------------------------
-# Accuracy calculation:
-# Compare predictions.csv last prediction vs actual last draw (exact match rate or overlap rate)
-# We'll compute overlap percentage (# predicted numbers that appear in actual draw / pick_count)
+# Utilities: parse coinryze.org format lines
+# Expected format:
+# issue_id,timestamp,number,color,size
+# e.g.
+# 202510131045, 15:25:00 10/13/2025, 3, Green , Small
 # --------------------------
-def compute_accuracy(pred_numbers, actual_numbers):
-    if not pred_numbers or not actual_numbers:
-        return 0.0
-    pred_set = set(pred_numbers)
-    actual_set = set(actual_numbers)
-    overlap = len(pred_set.intersection(actual_set))
-    return float(overlap) / float(len(pred_numbers)) * 100.0
+def parse_line_to_row(line):
+    parts = [p.strip() for p in line.split(",")]
+    # allow when color or size has trailing spaces
+    if len(parts) < 5:
+        return None
+    issue_id = parts[0]
+    timestamp = parts[1]
+    number = parts[2]
+    color = parts[3]
+    size = parts[4]
+    # normalize
+    return {
+        "issue_id": issue_id,
+        "timestamp": timestamp,
+        "number": str(int(float(number))) if number != "" else "",
+        "color": color,
+        "size": size,
+    }
 
 # --------------------------
-# App UI & logic
+# Streamlit UI
 # --------------------------
-st.set_page_config(page_title="Coinryze Analyzer + R2", layout="wide")
-st.title("Coinryze Analyzer + Cloudflare R2 (Full Dashboard)")
+st.set_page_config(page_title="Coinryze Analyzer (issue_id format)", layout="wide")
+st.title("Coinryze Analyzer — issue_id,timestamp,number,color,size")
 
-# Sidebar controls
-st.sidebar.header("Settings")
-auto_refresh_secs = st.sidebar.slider("Auto-refresh interval (seconds, 0 = off)", 0, 300, 0, step=5)
-pick_count = st.sidebar.number_input("Prediction size (how many numbers to predict)", min_value=1, max_value=10, value=6)
-show_debug = st.sidebar.checkbox("Show debug info", value=False)
+# Top-level controls
+col_top_a, col_top_b = st.columns([2,1])
+with col_top_b:
+    st.sidebar.header("Settings")
+    pick_count = st.sidebar.number_input("Prediction size (how many numbers)", min_value=1, max_value=5, value=1)
+    auto_predict_toggle = st.sidebar.checkbox("Auto-predict after adding a draw", value=True)
+    show_debug = st.sidebar.checkbox("Show debug", value=False)
 
-# Auto-refresh via injected JavaScript (works regardless of Streamlit version)
-if auto_refresh_secs and auto_refresh_secs > 0:
-    # Use meta refresh via JS to reload page after N seconds
-    js = f"""
-    <script>
-      // only reload if page is visible (avoid looping while hidden)
-      setTimeout(function() {{
-        if (document.visibilityState === 'visible') {{
-          location.reload();
-        }}
-      }}, {int(auto_refresh_secs * 1000)});
-    </script>
-    """
-    st.sidebar.markdown(f"Auto-refresh enabled every **{auto_refresh_secs}**s")
-    st.components.v1.html(js)
+# Manual single-draw form
+st.header("Manual Input — Add Single Last Draw")
+with st.form("single_draw"):
+    c1, c2, c3, c4, c5 = st.columns([1.2,1.8,1,1,1])
+    with c1:
+        issue_id = st.text_input("issue_id", placeholder="e.g. 202510131045")
+    with c2:
+        timestamp = st.text_input("timestamp", value=datetime.datetime.utcnow().strftime("%H:%M:%S %m/%d/%Y"))
+    with c3:
+        number = st.text_input("number (0-9)", placeholder="e.g. 3")
+    with c4:
+        color = st.text_input("color (optional)", value="", placeholder="e.g. Green")
+    with c5:
+        size = st.text_input("size (optional)", value="", placeholder="Small/Big")
+    submitted_single = st.form_submit_button("Add draw row")
 
-# Load existing dataframes
-last_draws = load_csv_from_r2_or_local(F_LAST_DRAWS, local_path="backend/data/seed.csv")
-predictions_df = load_csv_from_r2_or_local(F_PREDICTIONS)
-accuracy_log = load_csv_from_r2_or_local(F_ACCURACY)
+if submitted_single:
+    # infer missing color/size if not provided
+    if number is None or number == "":
+        st.error("Please provide a number 0-9.")
+    else:
+        if color == "" or size == "":
+            inferred_color = infer_color_from_number(number)
+            inferred_size = infer_size_from_number(number)
+            if color == "":
+                color = inferred_color
+            if size == "":
+                size = inferred_size
+        new_row = {
+            "issue_id": str(issue_id) if issue_id else datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S"),
+            "timestamp": str(timestamp),
+            "number": str(int(float(number))),
+            "color": color,
+            "size": size,
+        }
+        # append to top (most recent first)
+        last_draws = pd.concat([pd.DataFrame([new_row]), last_draws], ignore_index=True)
+        # persist to R2
+        r2_put_bytes(F_LAST_DRAWS, last_draws.to_csv(index=False).encode("utf-8"))
+        st.success("Draw added and synced to R2.")
+        # if auto-predict, generate and show
+        if auto_predict_toggle:
+            picks = predict_next_numbers(last_draws, pick_count=pick_count)
+            # prepare prediction record
+            rec = {
+                "created_at": datetime.datetime.utcnow().isoformat(),
+                "prediction": json.dumps(picks),
+                "pick_count": pick_count,
+            }
+            predictions_df = pd.concat([pd.DataFrame([rec]), predictions_df], ignore_index=True)
+            r2_put_bytes(F_PREDICTIONS, predictions_df.to_csv(index=False).encode("utf-8"))
+            st.info(f"Auto-prediction: {picks}")
+            # also log accuracy if you want to compare to previous draw (not done automatically)
+        st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.write("Added. Scroll to see updated tables.")
 
-# Ensure structure if None
-if last_draws is None:
-    last_draws = pd.DataFrame(columns=['date','n1','n2','n3','n4','n5','n6'])
-if predictions_df is None:
-    predictions_df = pd.DataFrame(columns=['created_at','prediction','pick_count'])
-if accuracy_log is None:
-    accuracy_log = pd.DataFrame(columns=['timestamp','predicted','actual','accuracy_pct'])
+st.write("---")
+# Paste multiple lines (copy-paste from coinryze.org)
+st.subheader("Paste lines from coinryze.org (one per line, same format)")
+multiline = st.text_area("Paste CSV lines here (issue_id,timestamp,number,color,size)", height=120, placeholder="Paste rows like:\n202510131045, 15:25:00 10/13/2025, 3, Green , Small")
+if st.button("Parse & Add Pasted Lines"):
+    lines = [l.strip() for l in multiline.splitlines() if l.strip() != ""]
+    added = 0
+    for L in lines:
+        parsed = parse_line_to_row(L)
+        if parsed:
+            # infer color/size if empty
+            if parsed["color"] == "" or parsed["size"] == "":
+                parsed["color"] = parsed["color"] or infer_color_from_number(parsed["number"])
+                parsed["size"] = parsed["size"] or infer_size_from_number(parsed["number"])
+            last_draws = pd.concat([pd.DataFrame([parsed]), last_draws], ignore_index=True)
+            added += 1
+    if added:
+        r2_put_bytes(F_LAST_DRAWS, last_draws.to_csv(index=False).encode("utf-8"))
+        st.success(f"Added {added} pasted rows and synced to R2.")
+        if auto_predict_toggle:
+            picks = predict_next_numbers(last_draws, pick_count=pick_count)
+            rec = {"created_at": datetime.datetime.utcnow().isoformat(), "prediction": json.dumps(picks), "pick_count": pick_count}
+            predictions_df = pd.concat([pd.DataFrame([rec]), predictions_df], ignore_index=True)
+            r2_put_bytes(F_PREDICTIONS, predictions_df.to_csv(index=False).encode("utf-8"))
+            st.info(f"Auto-prediction: {picks}")
+        st.experimental_rerun() if hasattr(st, "experimental_rerun") else None
+    else:
+        st.warning("No valid rows parsed. Check format (issue_id,timestamp,number,color,size).")
 
-# Layout: two columns top
-col1, col2 = st.columns([2,1])
+st.write("---")
+# Bulk file upload
+st.subheader("Bulk CSV Upload (one or more CSV files)")
+uploaded_files = st.file_uploader("Upload CSV(s) with columns issue_id,timestamp,number,color,size", accept_multiple_files=True, type=["csv"])
+if uploaded_files:
+    total_added = 0
+    for f in uploaded_files:
+        try:
+            df_new = pd.read_csv(f, dtype=str)
+            # try to normalize required columns
+            if not set(["issue_id", "timestamp", "number"]).issubset(set([c.lower() for c in df_new.columns])):
+                st.warning(f"File {f.name} missing required columns (issue_id,timestamp,number). Skipping.")
+                continue
+            # rename columns to canonical lower-case
+            df_new.columns = [c.strip() for c in df_new.columns]
+            # keep only required columns, try to map if case differs
+            df_new2 = pd.DataFrame()
+            for c in DRAW_COLS:
+                # find matching column ignoring case
+                match = next((orig for orig in df_new.columns if orig.lower() == c.lower()), None)
+                if match:
+                    df_new2[c] = df_new[match].astype(str)
+                else:
+                    df_new2[c] = ""
+            # infer missing color/size
+            for idx, row in df_new2.iterrows():
+                if row["color"] == "" or row["size"] == "":
+                    df_new2.at[idx, "color"] = row["color"] or infer_color_from_number(row["number"])
+                    df_new2.at[idx, "size"] = row["size"] or infer_size_from_number(row["number"])
+            last_draws = pd.concat([df_new2, last_draws], ignore_index=True)
+            total_added += df_new2.shape[0]
+        except Exception as e:
+            st.error(f"Failed to read {f.name}: {e}")
+    if total_added:
+        r2_put_bytes(F_LAST_DRAWS, last_draws.to_csv(index=False).encode("utf-8"))
+        st.success(f"Appended {total_added} rows from uploaded files and synced to R2.")
+        if auto_predict_toggle:
+            picks = predict_next_numbers(last_draws, pick_count=pick_count)
+            rec = {"created_at": datetime.datetime.utcnow().isoformat(), "prediction": json.dumps(picks), "pick_count": pick_count}
+            predictions_df = pd.concat([pd.DataFrame([rec]), predictions_df], ignore_index=True)
+            r2_put_bytes(F_PREDICTIONS, predictions_df.to_csv(index=False).encode("utf-8"))
+            st.info(f"Auto-prediction: {picks}")
+        st.experimental_rerun() if hasattr(st, "experimental_rerun") else None
 
-with col1:
-    st.subheader("Manual Input — Add Single Last Draw")
-    with st.form("single_draw_form", clear_on_submit=True):
-        # Accept date and numbers (comma separated)
-        date_val = st.date_input("Draw date", value=datetime.date.today())
-        nums_text = st.text_input("Draw numbers (comma separated)", placeholder="e.g. 3,8,15,22,27,34")
-        submitted = st.form_submit_button("Add draw")
-        if submitted:
-            try:
-                nums = [int(x.strip()) for x in nums_text.split(",") if x.strip()!='']
-                if len(nums) != pick_count:
-                    st.warning(f"You entered {len(nums)} numbers but prediction size in sidebar is {pick_count}. App will still store as provided.")
-                row = {'date': pd.to_datetime(date_val).strftime("%Y-%m-%d")}
-                for i in range(1, 7):
-                    row[f"n{i}"] = nums[i-1] if i-1 < len(nums) else np.nan
-                last_draws = pd.concat([pd.DataFrame([row]), last_draws], ignore_index=True)
-                st.success("Draw added locally.")
-                # Save to R2
-                save_df_to_r2(last_draws, F_LAST_DRAWS)
-                st.experimental_rerun() if hasattr(st, "experimental_rerun") else st.info("Refresh to see changes.")
-            except Exception as e:
-                st.error(f"Error parsing numbers: {e}")
-
-    st.write("---")
-    st.subheader("Bulk CSV Upload (append historical draws)")
-    st.markdown("Upload a CSV where columns include at least `date` and `n1`..`n6` (or similar).")
-    bulk_files = st.file_uploader("Upload CSV file(s)", type=["csv"], accept_multiple_files=True)
-    if bulk_files:
-        appended = 0
-        for bf in bulk_files:
-            try:
-                df_new = pd.read_csv(bf)
-                # Try to normalize columns: keep date and n* columns; if extra columns exist ignore
-                cols = [c for c in df_new.columns if c.lower().startswith('n') or c.lower()=='date']
-                if 'date' not in [c.lower() for c in df_new.columns]:
-                    st.warning(f"File {bf.name} missing 'date' column — skipping.")
-                    continue
-                df_new = df_new[cols]
-                # Append to existing last_draws (newest first)
-                last_draws = pd.concat([df_new, last_draws], ignore_index=True).drop_duplicates().reset_index(drop=True)
-                appended += len(df_new)
-            except Exception as e:
-                st.error(f"Failed to process {bf.name}: {e}")
-        if appended:
-            save_df_to_r2(last_draws, F_LAST_DRAWS)
-            st.success(f"Appended {appended} rows to last_draws and synced to R2.")
-            if hasattr(st, "experimental_rerun"):
-                st.experimental_rerun()
-
-    st.write("---")
-    st.subheader("Historical draws (top 50 shown)")
+st.write("---")
+# Historical draws (top 50)
+st.subheader("Historical draws (top 50 shown)")
+if last_draws is None or last_draws.shape[0] == 0:
+    st.info("No historical draws yet. Add via manual input or upload.")
+else:
+    # show top 50
     st.dataframe(last_draws.head(50))
 
-with col2:
-    st.subheader("Smart Predictions")
-    if last_draws.empty or last_draws.shape[0]==0:
-        st.info("No historical draws available — add draws first (manual or CSV).")
-    else:
-        # Ensure we have n1..n6 columns; if dataset has different pick_count, adapt
-        # We'll rely on simple_predict which expects n1..n6 columns; create them if missing
-        # Normalize column names
-        expected_ncols = [f"n{i}" for i in range(1, pick_count+1)]
-        # If last_draws doesn't have expected columns but has any n* columns - ok
-        pred = simple_predict(last_draws, pick_count=pick_count)
-        st.markdown(f"**Prediction ({pick_count} numbers):** `{', '.join(map(str,pred))}`")
-        # Save prediction to history (predictions_df)
-        if st.button("Save This Prediction"):
-            now = datetime.datetime.utcnow().isoformat()
-            predictions_df = pd.concat([pd.DataFrame([{
-                'created_at': now,
-                'prediction': json.dumps(pred),
-                'pick_count': pick_count
-            }]), predictions_df], ignore_index=True)
-            save_df_to_r2(predictions_df, F_PREDICTIONS)
-            st.success("Prediction saved and synced to R2.")
-        # Also allow immediate quick-evaluate against latest actual draw
-        latest_draw_row = last_draws.iloc[0] if last_draws.shape[0]>0 else None
-        if latest_draw_row is not None:
-            actual_nums = []
-            for c in last_draws.columns:
-                if c.startswith('n'):
-                    v = latest_draw_row.get(c)
-                    if pd.notna(v):
-                        actual_nums.append(int(v))
-            if actual_nums:
-                acc_pct = compute_accuracy(pred, actual_nums)
-                st.write(f"Overlap with latest draw ({latest_draw_row.get('date')}): **{acc_pct:.1f}%**")
-                if st.button("Log this accuracy to accuracy_log"):
-                    timestamp = datetime.datetime.utcnow().isoformat()
-                    accuracy_log = pd.concat([pd.DataFrame([{
-                        'timestamp': timestamp,
-                        'predicted': json.dumps(pred),
-                        'actual': json.dumps(actual_nums),
-                        'accuracy_pct': acc_pct
-                    }]), accuracy_log], ignore_index=True)
-                    save_df_to_r2(accuracy_log, F_ACCURACY)
-                    st.success("Logged accuracy and synced to R2.")
-
-    st.write("---")
-    st.subheader("Files in R2 bucket")
-    try:
-        keys = r2_list_keys()
-        if keys:
-            for k in keys:
-                st.write(f"- {k}")
-                # Provide download link/button
-                b = r2_get_object_bytes(k)
-                if b is not None:
-                    st.download_button(label=f"Download {k}", data=BytesIO(b), file_name=k)
-        else:
-            st.info("Bucket is empty (no keys found).")
-    except Exception as e:
-        st.error(f"Error listing R2 bucket: {e}")
-
-# --- Accuracy tracking and trend chart ---
-st.markdown("---")
-st.subheader("Accuracy Tracker & Trend")
-
-if not accuracy_log.empty:
-    # Prepare a time series
-    try:
-        accuracy_log['timestamp'] = pd.to_datetime(accuracy_log['timestamp'])
-        df_acc = accuracy_log.sort_values('timestamp', ascending=True)
-        st.write("Recent accuracy logs:")
-        st.dataframe(df_acc.head(50))
-        # Altair line chart
-        chart = alt.Chart(df_acc).mark_line(point=True).encode(
-            x='timestamp:T',
-            y='accuracy_pct:Q',
-            tooltip=['timestamp:T','accuracy_pct:Q']
-        ).properties(width=800, height=300, title='Accuracy over time')
-        st.altair_chart(chart, use_container_width=True)
-    except Exception as e:
-        st.error(f"Failed to render accuracy chart: {e}")
+st.write("---")
+# Smart Predictions section
+st.subheader("Smart Predictions (based on history)")
+if last_draws.shape[0] == 0:
+    st.info("No history to predict from.")
 else:
-    st.info("No accuracy logs yet. Log accuracy from the Smart Predictions pane after evaluating against a real draw.")
+    picks = predict_next_numbers(last_draws, pick_count=pick_count)
+    st.write("Predicted next numbers:", picks)
+    # show inferred color/size for each predicted number
+    pick_details = []
+    for p in picks:
+        pick_details.append({
+            "number": p,
+            "color": infer_color_from_number(p),
+            "size": infer_size_from_number(p)
+        })
+    st.table(pd.DataFrame(pick_details))
+    if st.button("Save this prediction"):
+        rec = {"created_at": datetime.datetime.utcnow().isoformat(), "prediction": json.dumps(picks), "pick_count": pick_count}
+        predictions_df = pd.concat([pd.DataFrame([rec]), predictions_df], ignore_index=True)
+        r2_put_bytes(F_PREDICTIONS, predictions_df.to_csv(index=False).encode("utf-8"))
+        st.success("Prediction saved to predictions.csv and synced to R2.")
 
-# --- Buttons for manual sync and housekeeping ---
-st.markdown("---")
-st.subheader("Utilities")
+st.write("---")
+# Predictions history and accuracy utilities
+st.subheader("Predictions history (top 20)")
+if predictions_df is None or predictions_df.shape[0] == 0:
+    st.info("No predictions yet.")
+else:
+    st.dataframe(predictions_df.head(20))
+    if st.button("Download predictions.csv"):
+        st.download_button("Download predictions.csv", data=predictions_df.to_csv(index=False).encode("utf-8"), file_name="predictions.csv")
 
-col_a, col_b = st.columns(2)
-with col_a:
-    if st.button("Sync all local dataframes to R2 (force)"):
-        ok1 = save_df_to_r2(last_draws, F_LAST_DRAWS)
-        ok2 = save_df_to_r2(predictions_df, F_PREDICTIONS)
-        ok3 = save_df_to_r2(accuracy_log, F_ACCURACY)
-        if ok1 and ok2 and ok3:
-            st.success("All files synced to R2.")
-        else:
-            st.warning("Some files may not have synced; check logs above.")
+# Accuracy logging helper: compare latest saved prediction to latest actual draw
+st.write("---")
+st.subheader("Evaluate last prediction vs latest actual draw")
+if predictions_df.shape[0] > 0 and last_draws.shape[0] > 0:
+    last_pred = json.loads(predictions_df.iloc[0]["prediction"])
+    latest_draw_num = None
+    try:
+        latest_draw_num = int(last_draws.iloc[0]["number"])
+    except:
+        latest_draw_num = None
+    st.write("Last prediction:", last_pred)
+    st.write("Latest actual draw (most recent):", latest_draw_num)
+    if latest_draw_num is not None:
+        overlap_pct = (len(set(last_pred).intersection({latest_draw_num})) / max(1, len(last_pred))) * 100.0
+        st.write(f"Overlap with latest draw: {overlap_pct:.1f}%")
+        if st.button("Log this accuracy"):
+            rec = {"timestamp": datetime.datetime.utcnow().isoformat(), "predicted": json.dumps(last_pred), "actual": json.dumps([latest_draw_num]), "accuracy_pct": overlap_pct}
+            accuracy_log = pd.concat([pd.DataFrame([rec]), accuracy_log], ignore_index=True)
+            r2_put_bytes(F_ACCURACY, accuracy_log.to_csv(index=False).encode("utf-8"))
+            st.success("Logged accuracy to accuracy_log.csv and synced to R2.")
+else:
+    st.info("Need at least one prediction and one actual draw to evaluate.")
 
-with col_b:
-    if st.button("Reload data from R2 (force)"):
-        # Force reload
-        ld = load_csv_from_r2_or_local(F_LAST_DRAWS, local_path="backend/data/seed.csv")
-        pdx = load_csv_from_r2_or_local(F_PREDICTIONS)
-        agr = load_csv_from_r2_or_local(F_ACCURACY)
-        if ld is not None:
+st.write("---")
+# Files in R2 and utilities
+st.subheader("R2 Files & Utilities")
+keys = r2_list_keys()
+if keys:
+    st.write("Files in bucket:")
+    for k in keys:
+        st.write("-", k)
+        b = r2_get_bytes(k)
+        if b is not None:
+            st.download_button(f"Download {k}", data=BytesIO(b), file_name=k)
+else:
+    st.info("No files found in R2 bucket.")
+
+col_u1, col_u2 = st.columns(2)
+with col_u1:
+    if st.button("Force sync all CSVs to R2"):
+        r2_put_bytes(F_LAST_DRAWS, last_draws.to_csv(index=False).encode("utf-8"))
+        r2_put_bytes(F_PREDICTIONS, predictions_df.to_csv(index=False).encode("utf-8"))
+        r2_put_bytes(F_ACCURACY, accuracy_log.to_csv(index=False).encode("utf-8"))
+        st.success("All CSVs uploaded to R2.")
+with col_u2:
+    if st.button("Reload CSVs from R2"):
+        ld = load_df_from_r2_or_local(F_LAST_DRAWS, local_path="backend/data/seed.csv", cols=DRAW_COLS)
+        pdx = load_df_from_r2_or_local(F_PREDICTIONS)
+        agr = load_df_from_r2_or_local(F_ACCURACY)
+        if ld is not None and ld.shape[0] > 0:
             last_draws = ld
         if pdx is not None:
             predictions_df = pdx
         if agr is not None:
             accuracy_log = agr
-        st.success("Reloaded available files from R2. Please scroll to sections to see updates.")
+        st.success("Reloaded CSVs from R2 (if present). Please scroll to sections to view updated tables.")
 
-# Debug info
+# debug
 if show_debug:
-    st.markdown("**DEBUG**")
-    st.write(f"R2 endpoint: {R2_ENDPOINT}")
-    st.write(f"Bucket: {R2_BUCKET}")
-    st.write("Keys in bucket:", r2_list_keys())
-    st.write("Last draws shape:", last_draws.shape)
-    st.write("Predictions shape:", predictions_df.shape)
-    st.write("Accuracy log shape:", accuracy_log.shape)
+    st.write("DEBUG INFO")
+    st.write("Last draws rows:", last_draws.shape[0])
+    st.write("Predictions rows:", predictions_df.shape[0])
+    st.write("Accuracy rows:", accuracy_log.shape[0])
+    st.write("R2 keys:", r2_list_keys())
 
-st.markdown("## Notes / How to use")
 st.markdown("""
-**Quick guide**
-1. **Add draws**
-   - Use *Manual Input* to add a single latest draw (enter exactly comma-separated numbers).
-   - Or upload historical CSV(s) in *Bulk CSV Upload*. CSV should include `date` and `n1..n6` (or similar).
-2. **Make predictions**
-   - Sidebar: set `Prediction size` (default 6).
-   - Smart Predictions box shows suggested numbers (based on historical frequency & simple streak penalty).
-   - Click *Save This Prediction* to record it in `predictions.csv` and sync to R2.
-   - Evaluate vs latest actual draw: click *Log this accuracy* to append to `accuracy_log.csv`.
-3. **Auto-refresh**
-   - In sidebar set Auto-refresh interval >0 to enable periodic page reloads.
-4. **Syncing**
-   - Files auto-save on add/upload actions; use `Sync all local dataframes to R2` to force push.
-   - Use `Reload data from R2` to pull latest files from R2.
-5. **Files stored in R2**
-   - last_draws.csv — historical draws
-   - predictions.csv — prediction history
-   - accuracy_log.csv — logged accuracy entries
-
-**CSV format expectations**
-- `last_draws.csv`: columns: `date`, `n1`, `n2`, ... up to number of picks (e.g. n6)
-- `predictions.csv`: created automatically (fields: created_at, prediction (json array), pick_count)
-- `accuracy_log.csv`: created automatically (timestamp, predicted (json array), actual (json array), accuracy_pct)
-
-**Security**
-- Consider moving R2 keys into environment variables or Streamlit secrets for production.
-""")
+## Quick how-to
+- Paste exact lines from coinryze.org into the paste box or add a single row using the form above.
+- Format must be: `issue_id,timestamp,number,color,size`
+- Example:
