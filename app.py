@@ -7,10 +7,10 @@ import pandas as pd
 # --------------------------
 # R2 Configuration
 # --------------------------
-R2_KEY_ID = "YOUR_R2_ACCESS_KEY_ID"
-R2_SECRET = "YOUR_R2_SECRET_ACCESS_KEY"
-R2_BUCKET = "YOUR_BUCKET_NAME"
-R2_ENDPOINT = "https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com"  # Actual endpoint
+R2_KEY_ID = "7423969d6d623afd9ae23258a6cd2839"         # Your R2 Access Key ID
+R2_SECRET = "dd858bf600c0d8e63cd047d128b46ad6df0427daef29f57c312530da322fc63c"     # Your R2 Secret Access Key
+R2_BUCKET = "coinryze-analyzer"                       # Your bucket name
+R2_ENDPOINT = "https://6d266c53f2f03219a25de8f12c50bc3b.r2.cloudflarestorage.com"
 
 # Create S3 client for R2
 s3 = boto3.client(
@@ -54,9 +54,8 @@ try:
 except ClientError as e:
     st.error(f"Error listing files: {e}")
 
-# --- Load seed CSV or example data (previous app) ---
+# --- Load seed CSV or example data ---
 st.header("Coinryze Data Table")
-# Example: load a local CSV or R2 CSV
 try:
     # If you have a seed CSV locally
     seed_df = pd.read_csv("backend/data/seed.csv")
@@ -64,7 +63,7 @@ try:
 except FileNotFoundError:
     st.warning("Seed CSV not found. You can upload a CSV to the R2 bucket.")
 
-# --- Additional dashboard controls (from previous app) ---
+# --- Additional dashboard controls ---
 st.header("Dashboard Controls")
 refresh_button = st.button("Refresh Data")
 if refresh_button:
