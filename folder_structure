@@ -1,0 +1,4 @@
+CoinryzeAnalyzer/
+│
+├─ app.py            # main Streamlit app
+├─ requirements.txt  # dependencies
