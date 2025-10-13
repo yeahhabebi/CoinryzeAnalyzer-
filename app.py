@@ -443,4 +443,9 @@ st.markdown("""
 ## Quick how-to
 - Paste exact lines from coinryze.org into the paste box or add a single row using the form above.
 - Format must be: `issue_id,timestamp,number,color,size`
-- Example:
+- Example:202510131045, 15:25:00 10/13/2025, 3, Green , Small
+          202510131046, 15:26:00 10/13/2025, 6, Red, Big
+- Auto-predict toggle (sidebar) will create a prediction automatically after adding draws.
+- Use "Force sync all CSVs to R2" to ensure files are present in your bucket.
+""")
+     
