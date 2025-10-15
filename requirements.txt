@@ -1,4 +1,6 @@
 streamlit
+boto3
 pandas
 numpy
-boto3
+scikit-learn
+matplotlib
