@@ -1,6 +1,7 @@
 streamlit
-boto3
 pandas
 numpy
-scikit-learn
+boto3
 matplotlib
+seaborn
+scikit-learn
